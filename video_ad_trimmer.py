@@ -122,6 +122,7 @@ def main() -> int:
     cut.add_argument("-o", "--output", default=None, help="Directory for trimmed videos. Defaults to each source directory.")
     cut.add_argument("--overwrite", action="store_true", help="Overwrite existing trimmed videos.")
     cut.add_argument("--copy-unchanged", action="store_true", help="Copy videos where both sides are marked as no ads.")
+    cut.add_argument("--reencode", action="store_true", help="Re-encode output for exact cuts and to avoid boundary glitches.")
     cut.add_argument("--dry-run", action="store_true", help="Print ffmpeg commands without running them.")
 
     csv_cmd = subparsers.add_parser("csv", help="Create LosslessCut-compatible CSV from selections.")
@@ -587,7 +588,11 @@ def cut_videos(args: argparse.Namespace, tools: ToolPaths) -> None:
             print(f"skip {item['name']}: no ads selected, source will stay unchanged")
             continue
         keyframe_aligned = True
-        if args.dry_run and (not resolve_executable(tools.ffprobe) or not source.exists()):
+        if args.reencode:
+            start = requested_start
+            end = requested_end
+            keyframe_aligned = False
+        elif args.dry_run and (not resolve_executable(tools.ffprobe) or not source.exists()):
             start = requested_start
             end = requested_end
             keyframe_aligned = False
@@ -598,9 +603,9 @@ def cut_videos(args: argparse.Namespace, tools: ToolPaths) -> None:
             print(f"skip {item['name']}: invalid range {start}..{end}")
             continue
         output = output_path_for_source(output_dir, source, args.overwrite)
-        cmd = build_cut_command(tools.ffmpeg, source, output, start, end, args.overwrite)
+        cmd = build_cut_command(tools.ffmpeg, source, output, start, end, args.overwrite, reencode=args.reencode)
         if args.dry_run:
-            note = "" if keyframe_aligned else " (keyframe alignment skipped)"
+            note = " (re-encode exact cut)" if args.reencode else ("" if keyframe_aligned else " (keyframe alignment skipped)")
             print(
                 f"# {source.name}: selected {format_timestamp(requested_start)} -> {format_timestamp(requested_end)}, "
                 f"actual {format_timestamp(start)} -> {format_timestamp(end)}{note}"
@@ -723,9 +728,43 @@ def build_cut_command(
     start: float,
     end: float,
     overwrite: bool,
+    reencode: bool = False,
 ) -> list[str]:
     base = [ffmpeg, "-hide_banner", "-loglevel", "error"]
     base.append("-y" if overwrite else "-n")
+    if reencode:
+        return [
+            *base,
+            "-ss",
+            format_seconds(start),
+            "-i",
+            str(source),
+            "-t",
+            format_seconds(max(0.0, end - start)),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map",
+            "0:s?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-c:s",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
     return [
         *base,
         "-ss",
@@ -864,6 +903,7 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             self.front_scan_seconds = DEFAULT_SCAN_SECONDS
             self.back_scan_seconds = DEFAULT_SCAN_SECONDS
             self.cut_output_dir: Path | None = None
+            self.reencode_output_var = tk.BooleanVar(value=False)
             self._build()
             if self.dnd_enabled:
                 self._set_status("请选择视频/目录，或直接拖拽视频/目录到窗口。")
@@ -939,6 +979,9 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             self.canvas.grid(row=1, column=0, sticky="nsew")
             self.scrollbar.grid(row=1, column=1, sticky="ns")
             self.canvas.bind("<Configure>", self._resize_canvas_window)
+            self.root.bind_all("<MouseWheel>", self._on_canvas_mousewheel, add="+")
+            self.root.bind_all("<Button-4>", self._on_canvas_mousewheel, add="+")
+            self.root.bind_all("<Button-5>", self._on_canvas_mousewheel, add="+")
             self._setup_drag_drop()
 
             bottom = ttk.Frame(right)
@@ -951,9 +994,29 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             ttk.Entry(bottom, textvariable=self.back_offset_var, width=8).pack(side="left", padx=(4, 12))
             ttk.Button(bottom, text="保存当前选择", command=self._save_current_selection).pack(side="left")
             ttk.Button(bottom, text="应用当前选择到全部视频", command=self._apply_current_selection_to_all).pack(side="left", padx=(8, 0))
+            ttk.Checkbutton(bottom, text="精准生成(慢速/避免花屏)", variable=self.reencode_output_var).pack(side="left", padx=(12, 0))
 
         def _resize_canvas_window(self, event: Any) -> None:
             self.canvas.itemconfigure(self.canvas_window, width=event.width)
+
+        def _on_canvas_mousewheel(self, event: Any) -> str | None:
+            left = self.canvas.winfo_rootx()
+            top = self.canvas.winfo_rooty()
+            right = left + self.canvas.winfo_width()
+            bottom = top + self.canvas.winfo_height()
+            if not (left <= event.x_root < right and top <= event.y_root < bottom):
+                return None
+            if getattr(event, "num", None) == 4:
+                units = -3
+            elif getattr(event, "num", None) == 5:
+                units = 3
+            else:
+                delta = getattr(event, "delta", 0)
+                if delta == 0:
+                    return "break"
+                units = -max(1, abs(delta) // 120) if delta > 0 else max(1, abs(delta) // 120)
+            self.canvas.yview_scroll(units, "units")
+            return "break"
 
         def _setup_drag_drop(self) -> None:
             if not self.dnd_enabled:
@@ -1254,13 +1317,17 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
                 if unchanged:
                     results.append(f"跳过 {source.name}: 无片头/片尾广告")
                     continue
-                start = find_nearest_keyframe(source, requested_start, self.tools, prefer="before")
-                end = find_nearest_keyframe(source, requested_end, self.tools, prefer="after")
+                if self.reencode_output_var.get():
+                    start = requested_start
+                    end = requested_end
+                else:
+                    start = find_nearest_keyframe(source, requested_start, self.tools, prefer="before")
+                    end = find_nearest_keyframe(source, requested_end, self.tools, prefer="after")
                 if end <= start:
                     results.append(f"跳过 {source.name}: 裁剪范围无效")
                     continue
                 output = timestamped_output_path_for_source(self.cut_output_dir, source, overwrite=False, timestamp=timestamp)
-                cmd = build_cut_command(self.tools.ffmpeg, source, output, start, end, overwrite=False)
+                cmd = build_cut_command(self.tools.ffmpeg, source, output, start, end, overwrite=False, reencode=self.reencode_output_var.get())
                 self._ui(lambda name=source.name: self._set_status(f"正在生成: {name}"))
                 run_command(cmd, capture=False)
                 results.append(f"{output} ({format_file_size(output.stat().st_size)})")

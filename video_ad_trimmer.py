@@ -52,6 +52,11 @@ DEFAULT_MIN_SEGMENT_SECONDS = 12.0
 DEFAULT_MERGE_GAP_SECONDS = 1.0
 DEFAULT_MAX_SEGMENTS_PER_SIDE = 30
 DEFAULT_GUI_OUTPUT_ROOT = "ad_trim_output"
+PORTABLE_TOOL_DIRS = (
+    Path("ffmpeg") / "bin",
+    Path("tools") / "ffmpeg" / "bin",
+    Path("_internal") / "ffmpeg" / "bin",
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,10 @@ class ToolError(RuntimeError):
 
 
 def main() -> int:
+    argv = sys.argv[1:]
+    if not argv and getattr(sys, "frozen", False):
+        argv = ["gui"]
+
     parser = argparse.ArgumentParser(
         description="Analyze video heads/tails, export candidate ad thumbnails, and batch trim selections."
     )
@@ -128,7 +137,7 @@ def main() -> int:
     gui = subparsers.add_parser("gui", help="Open the desktop review and trimming app.")
     gui.add_argument("--output-root", default=DEFAULT_GUI_OUTPUT_ROOT, help="Directory for GUI analysis sessions.")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     tools = discover_tool_paths(ToolPaths(args.ffmpeg, args.ffprobe))
 
     try:
@@ -172,9 +181,41 @@ def require_tools(tools: ToolPaths, need_probe: bool = True) -> None:
 
 
 def discover_tool_paths(tools: ToolPaths) -> ToolPaths:
-    ffmpeg = resolve_executable(tools.ffmpeg) or find_winget_tool("ffmpeg.exe") or tools.ffmpeg
-    ffprobe = resolve_executable(tools.ffprobe) or find_winget_tool("ffprobe.exe") or tools.ffprobe
+    bundled_ffmpeg = find_portable_tool("ffmpeg.exe") if is_default_tool_name(tools.ffmpeg, "ffmpeg") else None
+    bundled_ffprobe = find_portable_tool("ffprobe.exe") if is_default_tool_name(tools.ffprobe, "ffprobe") else None
+    ffmpeg = bundled_ffmpeg or resolve_executable(tools.ffmpeg) or find_winget_tool("ffmpeg.exe") or tools.ffmpeg
+    ffprobe = bundled_ffprobe or resolve_executable(tools.ffprobe) or find_winget_tool("ffprobe.exe") or tools.ffprobe
     return ToolPaths(ffmpeg=ffmpeg, ffprobe=ffprobe)
+
+
+def is_default_tool_name(value: str, tool_name: str) -> bool:
+    return value.lower() in {tool_name, f"{tool_name}.exe"}
+
+
+def portable_roots() -> list[Path]:
+    roots = [Path(__file__).resolve().parent]
+    if getattr(sys, "frozen", False):
+        roots.insert(0, Path(sys.executable).resolve().parent)
+        bundle_dir = getattr(sys, "_MEIPASS", None)
+        if bundle_dir:
+            roots.insert(0, Path(bundle_dir).resolve())
+    unique_roots = []
+    for root in roots:
+        if root not in unique_roots:
+            unique_roots.append(root)
+    return unique_roots
+
+
+def find_portable_tool(filename: str) -> str | None:
+    for root in portable_roots():
+        for relative_dir in PORTABLE_TOOL_DIRS:
+            candidate = root / relative_dir / filename
+            if candidate.exists():
+                return str(candidate)
+        candidate = root / filename
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 def find_winget_tool(filename: str) -> str | None:
@@ -1647,13 +1688,16 @@ REVIEW_HTML_TEMPLATE = r"""<!doctype html>
 
 
 def run_command(cmd: list[str], capture: bool) -> subprocess.CompletedProcess[str]:
+    run_kwargs: dict[str, Any] = {"check": False}
+    if os.name == "nt":
+        run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
         if capture:
             raw_result = subprocess.run(
                 cmd,
-                check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                **run_kwargs,
             )
             result = subprocess.CompletedProcess(
                 raw_result.args,
@@ -1662,7 +1706,7 @@ def run_command(cmd: list[str], capture: bool) -> subprocess.CompletedProcess[st
                 stderr=decode_process_output(raw_result.stderr),
             )
         else:
-            result = subprocess.run(cmd, check=False)
+            result = subprocess.run(cmd, **run_kwargs)
     except FileNotFoundError as exc:
         raise ToolError(f"Command not found: {cmd[0]}") from exc
     if result.returncode != 0:

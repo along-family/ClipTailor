@@ -5,7 +5,7 @@ Batch helper for trimming uncertain intro/outro ad blocks from videos.
 Workflow:
   1. analyze: detect candidate segments at the head/tail and export first frames.
   2. serve: open a tiny local review API for saving selections from review.html.
-  3. cut: trim videos from saved selections with ffmpeg stream copy.
+ 3. cut: trim videos from saved selections with ffmpeg stream copy or exact re-encode.
 
 The script intentionally keeps the final ad decision human-in-the-loop. Scene
 cuts are used only to produce useful candidate chunks and thumbnails.
@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -48,10 +49,14 @@ VIDEO_EXTENSIONS = {
 
 DEFAULT_SCAN_SECONDS = 5 * 60
 DEFAULT_SCENE_THRESHOLD = 0.32
-DEFAULT_MIN_SEGMENT_SECONDS = 12.0
+DEFAULT_MIN_SEGMENT_SECONDS = 6.0
 DEFAULT_MERGE_GAP_SECONDS = 1.0
-DEFAULT_MAX_SEGMENTS_PER_SIDE = 30
+DEFAULT_MAX_SEGMENTS_PER_SIDE = 45
 DEFAULT_GUI_OUTPUT_ROOT = "ad_trim_output"
+DEFAULT_AUTO_REENCODE_THRESHOLD = 0.5
+KEYFRAME_SEARCH_WINDOW_SECONDS = 120.0
+SMART_RENDER_MIN_COPY_SECONDS = 1.0
+PREFERRED_VIDEO_ENCODERS = ("h264_nvenc", "h264_qsv", "h264_amf", "libx264")
 PORTABLE_TOOL_DIRS = (
     Path("ffmpeg") / "bin",
     Path("tools") / "ffmpeg" / "bin",
@@ -71,6 +76,40 @@ class Segment:
     start: float
     end: float
     thumbnail: str
+
+
+@dataclass(frozen=True)
+class RenderSegment:
+    label: str
+    mode: str
+    start: float
+    end: float
+
+
+@dataclass(frozen=True)
+class SourceProfile:
+    video_codec: str | None
+    audio_codec: str | None
+    audio_streams: int
+    subtitle_streams: int
+
+
+@dataclass(frozen=True)
+class CutPlan:
+    mode: str
+    decision: str
+    requested_start: float
+    requested_end: float
+    actual_start: float
+    actual_end: float
+    keyframe_start: float
+    keyframe_end: float
+    start_delta: float
+    end_delta: float
+    alignment_available: bool
+    video_encoder: str | None = None
+    segments: tuple[RenderSegment, ...] = ()
+    fallback_reason: str | None = None
 
 
 class ToolError(RuntimeError):
@@ -122,7 +161,14 @@ def main() -> int:
     cut.add_argument("-o", "--output", default=None, help="Directory for trimmed videos. Defaults to each source directory.")
     cut.add_argument("--overwrite", action="store_true", help="Overwrite existing trimmed videos.")
     cut.add_argument("--copy-unchanged", action="store_true", help="Copy videos where both sides are marked as no ads.")
-    cut.add_argument("--reencode", action="store_true", help="Re-encode output for exact cuts and to avoid boundary glitches.")
+    cut.add_argument("--smart-render-edges", action="store_true", help="Re-encode only the cut edges and copy the middle section.")
+    cut.add_argument("--reencode", action="store_true", help="Always re-encode output for exact cuts.")
+    cut.add_argument(
+        "--auto-reencode-threshold",
+        type=float,
+        default=DEFAULT_AUTO_REENCODE_THRESHOLD,
+        help="Auto-switch to exact re-encode when keyframe cuts drift more than this many seconds.",
+    )
     cut.add_argument("--dry-run", action="store_true", help="Print ffmpeg commands without running them.")
 
     csv_cmd = subparsers.add_parser("csv", help="Create LosslessCut-compatible CSV from selections.")
@@ -587,36 +633,28 @@ def cut_videos(args: argparse.Namespace, tools: ToolPaths) -> None:
         if unchanged and not args.copy_unchanged:
             print(f"skip {item['name']}: no ads selected, source will stay unchanged")
             continue
-        keyframe_aligned = True
-        if args.reencode:
-            start = requested_start
-            end = requested_end
-            keyframe_aligned = False
-        elif args.dry_run and (not resolve_executable(tools.ffprobe) or not source.exists()):
-            start = requested_start
-            end = requested_end
-            keyframe_aligned = False
-        else:
-            start = find_nearest_keyframe(source, requested_start, tools, prefer="before")
-            end = find_nearest_keyframe(source, requested_end, tools, prefer="after")
-        if end <= start:
-            print(f"skip {item['name']}: invalid range {start}..{end}")
+        plan = choose_cut_plan(
+            source=source,
+            requested_start=requested_start,
+            requested_end=requested_end,
+            tools=tools,
+            force_precise=args.reencode,
+            prefer_smart_edges=args.smart_render_edges,
+            auto_reencode_threshold=max(0.0, float(args.auto_reencode_threshold)),
+            allow_missing_alignment=args.dry_run,
+        )
+        if plan.actual_end <= plan.actual_start:
+            print(f"skip {item['name']}: invalid range {plan.actual_start}..{plan.actual_end}")
             continue
         output = output_path_for_source(output_dir, source, args.overwrite)
-        cmd = build_cut_command(tools.ffmpeg, source, output, start, end, args.overwrite, reencode=args.reencode)
         if args.dry_run:
-            note = " (re-encode exact cut)" if args.reencode else ("" if keyframe_aligned else " (keyframe alignment skipped)")
-            print(
-                f"# {source.name}: selected {format_timestamp(requested_start)} -> {format_timestamp(requested_end)}, "
-                f"actual {format_timestamp(start)} -> {format_timestamp(end)}{note}"
-            )
-            print(" ".join(quote_arg(part) for part in cmd))
+            print(f"# {source.name}: {format_cut_plan_summary(plan)}")
+            commands = execute_cut_plan(plan, tools, source, output, args.overwrite, dry_run=True)
+            for command in commands:
+                print(" ".join(quote_arg(part) for part in command))
             continue
-        print(
-            f"cut {source.name}: selected {format_timestamp(requested_start)} -> {format_timestamp(requested_end)}, "
-            f"actual {format_timestamp(start)} -> {format_timestamp(end)}"
-        )
-        run_command(cmd, capture=False)
+        print(f"cut {source.name}: {format_cut_plan_summary(plan)}")
+        execute_cut_plan(plan, tools, source, output, args.overwrite, dry_run=False)
         print(f"  wrote {output} ({format_file_size(output.stat().st_size)})")
 
 
@@ -677,9 +715,16 @@ def get_segment_by_index(segments: list[dict[str, Any]], index: int) -> dict[str
     return None
 
 
-def find_nearest_keyframe(video: Path, seconds: float, tools: ToolPaths, prefer: str) -> float:
-    search_start = max(0.0, seconds - 10.0)
-    search_end = seconds + 10.0
+def find_nearest_keyframe(
+    video: Path,
+    seconds: float,
+    tools: ToolPaths,
+    prefer: str,
+    *,
+    search_window_seconds: float = KEYFRAME_SEARCH_WINDOW_SECONDS,
+) -> tuple[float, bool]:
+    search_start = max(0.0, seconds - search_window_seconds)
+    search_end = seconds + search_window_seconds
     cmd = [
         tools.ffprobe,
         "-v",
@@ -709,16 +754,370 @@ def find_nearest_keyframe(video: Path, seconds: float, tools: ToolPaths, prefer:
             except ValueError:
                 continue
     if not keyframes:
-        return seconds
+        return seconds, False
     if prefer == "before":
         candidates = [value for value in keyframes if value <= seconds]
         if candidates:
-            return max(candidates)
+            return max(candidates), True
+        return min(keyframes, key=lambda value: abs(value - seconds)), False
     if prefer == "after":
         candidates = [value for value in keyframes if value >= seconds]
         if candidates:
-            return min(candidates)
-    return min(keyframes, key=lambda value: abs(value - seconds))
+            return min(candidates), True
+        return min(keyframes, key=lambda value: abs(value - seconds)), False
+    return min(keyframes, key=lambda value: abs(value - seconds)), True
+
+
+def choose_cut_plan(
+    *,
+    source: Path,
+    requested_start: float,
+    requested_end: float,
+    tools: ToolPaths,
+    force_precise: bool,
+    prefer_smart_edges: bool,
+    auto_reencode_threshold: float,
+    allow_missing_alignment: bool = False,
+) -> CutPlan:
+    keyframe_start, keyframe_end, alignment_available = resolve_keyframe_range(
+        source,
+        requested_start,
+        requested_end,
+        tools,
+        allow_missing_alignment=allow_missing_alignment,
+    )
+    start_delta = abs(keyframe_start - requested_start)
+    end_delta = abs(keyframe_end - requested_end)
+    if force_precise:
+        return CutPlan(
+            mode="precise",
+            decision="forced",
+            requested_start=requested_start,
+            requested_end=requested_end,
+            actual_start=requested_start,
+            actual_end=requested_end,
+            keyframe_start=keyframe_start,
+            keyframe_end=keyframe_end,
+            start_delta=start_delta,
+            end_delta=end_delta,
+            alignment_available=alignment_available,
+            video_encoder=get_preferred_video_encoder(tools.ffmpeg),
+            segments=(RenderSegment("full", "precise", requested_start, requested_end),),
+        )
+    if prefer_smart_edges:
+        return choose_smart_cut_plan(
+            source=source,
+            requested_start=requested_start,
+            requested_end=requested_end,
+            keyframe_start=keyframe_start,
+            keyframe_end=keyframe_end,
+            alignment_available=alignment_available,
+            start_delta=start_delta,
+            end_delta=end_delta,
+            tools=tools,
+        )
+    return CutPlan(
+        mode="copy",
+        decision="copy",
+        requested_start=requested_start,
+        requested_end=requested_end,
+        actual_start=keyframe_start,
+        actual_end=keyframe_end,
+        keyframe_start=keyframe_start,
+        keyframe_end=keyframe_end,
+        start_delta=start_delta,
+        end_delta=end_delta,
+        alignment_available=alignment_available,
+        fallback_reason=(
+            f"drift {format_seconds(max(start_delta, end_delta))}s"
+            if alignment_available and max(start_delta, end_delta) > auto_reencode_threshold
+            else None
+        ),
+        segments=(RenderSegment("full", "copy", keyframe_start, keyframe_end),),
+    )
+
+
+def choose_smart_cut_plan(
+    *,
+    source: Path,
+    requested_start: float,
+    requested_end: float,
+    keyframe_start: float,
+    keyframe_end: float,
+    alignment_available: bool,
+    start_delta: float,
+    end_delta: float,
+    tools: ToolPaths,
+) -> CutPlan:
+    if not alignment_available:
+        return build_precise_fallback_plan(
+            requested_start=requested_start,
+            requested_end=requested_end,
+            keyframe_start=keyframe_start,
+            keyframe_end=keyframe_end,
+            start_delta=start_delta,
+            end_delta=end_delta,
+            alignment_available=alignment_available,
+            tools=tools,
+            reason="keyframe unavailable",
+        )
+    try:
+        profile = probe_source_profile(source, tools)
+    except ToolError as exc:
+        return build_precise_fallback_plan(
+            requested_start=requested_start,
+            requested_end=requested_end,
+            keyframe_start=keyframe_start,
+            keyframe_end=keyframe_end,
+            start_delta=start_delta,
+            end_delta=end_delta,
+            alignment_available=alignment_available,
+            tools=tools,
+            reason=str(exc),
+        )
+    compatible, reason = check_smart_render_compatibility(profile)
+    if not compatible:
+        return build_precise_fallback_plan(
+            requested_start=requested_start,
+            requested_end=requested_end,
+            keyframe_start=keyframe_start,
+            keyframe_end=keyframe_end,
+            start_delta=start_delta,
+            end_delta=end_delta,
+            alignment_available=alignment_available,
+            tools=tools,
+            reason=reason,
+        )
+    middle_start, middle_start_found = find_nearest_keyframe(source, requested_start, tools, prefer="after")
+    middle_end, middle_end_found = find_nearest_keyframe(source, requested_end, tools, prefer="before")
+    if not middle_start_found or not middle_end_found:
+        return build_precise_fallback_plan(
+            requested_start=requested_start,
+            requested_end=requested_end,
+            keyframe_start=keyframe_start,
+            keyframe_end=keyframe_end,
+            start_delta=start_delta,
+            end_delta=end_delta,
+            alignment_available=alignment_available,
+            tools=tools,
+            reason="smart edges could not find inner keyframes",
+        )
+    segments: list[RenderSegment] = []
+    if requested_start < middle_start:
+        segments.append(RenderSegment("head", "precise", requested_start, middle_start))
+    if middle_end - middle_start >= SMART_RENDER_MIN_COPY_SECONDS:
+        segments.append(RenderSegment("middle", "copy", middle_start, middle_end))
+    elif requested_start < middle_start or middle_end < requested_end:
+        return build_precise_fallback_plan(
+            requested_start=requested_start,
+            requested_end=requested_end,
+            keyframe_start=keyframe_start,
+            keyframe_end=keyframe_end,
+            start_delta=start_delta,
+            end_delta=end_delta,
+            alignment_available=alignment_available,
+            tools=tools,
+            reason="middle copy section is too short",
+        )
+    if middle_end < requested_end:
+        segments.append(RenderSegment("tail", "precise", middle_end, requested_end))
+    if not any(segment.mode == "copy" for segment in segments):
+        return build_precise_fallback_plan(
+            requested_start=requested_start,
+            requested_end=requested_end,
+            keyframe_start=keyframe_start,
+            keyframe_end=keyframe_end,
+            start_delta=start_delta,
+            end_delta=end_delta,
+            alignment_available=alignment_available,
+            tools=tools,
+            reason="selection stays inside one GOP",
+        )
+    return CutPlan(
+        mode="smart",
+        decision="smart",
+        requested_start=requested_start,
+        requested_end=requested_end,
+        actual_start=requested_start,
+        actual_end=requested_end,
+        keyframe_start=keyframe_start,
+        keyframe_end=keyframe_end,
+        start_delta=start_delta,
+        end_delta=end_delta,
+        alignment_available=True,
+        video_encoder=get_preferred_video_encoder(tools.ffmpeg),
+        segments=tuple(segments),
+    )
+
+
+def build_precise_fallback_plan(
+    *,
+    requested_start: float,
+    requested_end: float,
+    keyframe_start: float,
+    keyframe_end: float,
+    start_delta: float,
+    end_delta: float,
+    alignment_available: bool,
+    tools: ToolPaths,
+    reason: str,
+) -> CutPlan:
+    return CutPlan(
+        mode="precise",
+        decision="fallback",
+        requested_start=requested_start,
+        requested_end=requested_end,
+        actual_start=requested_start,
+        actual_end=requested_end,
+        keyframe_start=keyframe_start,
+        keyframe_end=keyframe_end,
+        start_delta=start_delta,
+        end_delta=end_delta,
+        alignment_available=alignment_available,
+        video_encoder=get_preferred_video_encoder(tools.ffmpeg),
+        segments=(RenderSegment("full", "precise", requested_start, requested_end),),
+        fallback_reason=reason,
+    )
+
+
+def probe_source_profile(source: Path, tools: ToolPaths) -> SourceProfile:
+    cmd = [
+        tools.ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,codec_name",
+        "-of",
+        "json",
+        str(source),
+    ]
+    result = run_command(cmd, capture=True)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"Could not parse stream profile for {source.name}") from exc
+    video_codec: str | None = None
+    audio_codec: str | None = None
+    audio_streams = 0
+    subtitle_streams = 0
+    for stream in payload.get("streams", []):
+        codec_type = stream.get("codec_type")
+        codec_name = stream.get("codec_name")
+        if codec_type == "video" and video_codec is None:
+            video_codec = codec_name
+        elif codec_type == "audio":
+            audio_streams += 1
+            if audio_codec is None:
+                audio_codec = codec_name
+        elif codec_type == "subtitle":
+            subtitle_streams += 1
+    return SourceProfile(
+        video_codec=video_codec,
+        audio_codec=audio_codec,
+        audio_streams=audio_streams,
+        subtitle_streams=subtitle_streams,
+    )
+
+
+def check_smart_render_compatibility(profile: SourceProfile) -> tuple[bool, str]:
+    if profile.video_codec != "h264":
+        return False, f"smart render currently supports h264 video, got {profile.video_codec or 'unknown'}"
+    if profile.audio_streams > 1:
+        return False, "smart render currently supports only one audio stream"
+    if profile.audio_codec not in (None, "aac"):
+        return False, f"smart render currently supports AAC audio, got {profile.audio_codec}"
+    if profile.subtitle_streams > 0:
+        return False, "smart render currently does not support subtitle streams"
+    return True, ""
+
+
+def resolve_keyframe_range(
+    source: Path,
+    requested_start: float,
+    requested_end: float,
+    tools: ToolPaths,
+    *,
+    allow_missing_alignment: bool,
+) -> tuple[float, float, bool]:
+    if allow_missing_alignment and (not resolve_executable(tools.ffprobe) or not source.exists()):
+        return requested_start, requested_end, False
+    start_value, start_found = find_nearest_keyframe(source, requested_start, tools, prefer="before")
+    end_value, end_found = find_nearest_keyframe(source, requested_end, tools, prefer="after")
+    return (
+        start_value,
+        end_value,
+        start_found and end_found,
+    )
+
+
+_VIDEO_ENCODER_CACHE: dict[str, str] = {}
+
+
+def get_preferred_video_encoder(ffmpeg: str) -> str:
+    resolved_ffmpeg = resolve_executable(ffmpeg) or ffmpeg
+    cached = _VIDEO_ENCODER_CACHE.get(resolved_ffmpeg)
+    if cached:
+        return cached
+    try:
+        result = run_command([ffmpeg, "-hide_banner", "-encoders"], capture=True)
+        available = parse_ffmpeg_encoder_names(result.stdout)
+    except ToolError:
+        available = set()
+    encoder = pick_preferred_video_encoder(available)
+    _VIDEO_ENCODER_CACHE[resolved_ffmpeg] = encoder
+    return encoder
+
+
+def parse_ffmpeg_encoder_names(output: str) -> set[str]:
+    encoders: set[str] = set()
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and len(parts[0]) == 6 and all(char.isupper() or char == "." for char in parts[0]):
+            encoders.add(parts[1])
+    return encoders
+
+
+def pick_preferred_video_encoder(available: set[str]) -> str:
+    for encoder in PREFERRED_VIDEO_ENCODERS:
+        if encoder in available:
+            return encoder
+    return "libx264"
+
+
+def format_cut_plan_summary(plan: CutPlan) -> str:
+    requested = f"requested {format_timestamp(plan.requested_start)} -> {format_timestamp(plan.requested_end)}"
+    if plan.alignment_available:
+        aligned = f"keyframe {format_timestamp(plan.keyframe_start)} -> {format_timestamp(plan.keyframe_end)}"
+    else:
+        aligned = "keyframe unavailable"
+    if plan.mode == "smart":
+        segment_text = " | ".join(
+            f"{segment.label}:{segment.mode} {format_timestamp(segment.start)}->{format_timestamp(segment.end)}"
+            for segment in plan.segments
+        )
+        mode = f"smart ({plan.video_encoder})"
+        reason = plan.fallback_reason or "edges reencoded, middle copied"
+        actual = f"actual {format_timestamp(plan.actual_start)} -> {format_timestamp(plan.actual_end)}"
+        return f"{requested}, {aligned}, {actual}, mode {mode}, {segment_text}, {reason}"
+    mode = "copy" if plan.mode == "copy" else f"precise ({plan.video_encoder})"
+    if plan.mode == "precise" and plan.decision == "forced":
+        reason = "forced exact"
+    elif plan.mode == "precise" and plan.decision == "fallback":
+        reason = f"exact fallback, {plan.fallback_reason or 'smart render unavailable'}"
+    elif plan.mode == "precise":
+        reason = f"auto exact, drift {format_seconds(max(plan.start_delta, plan.end_delta))}s"
+    else:
+        reason = f"drift {format_seconds(max(plan.start_delta, plan.end_delta))}s"
+    actual = f"actual {format_timestamp(plan.actual_start)} -> {format_timestamp(plan.actual_end)}"
+    return f"{requested}, {aligned}, {actual}, mode {mode}, {reason}"
+
+
+def format_gui_cut_plan_mode(plan: CutPlan) -> str:
+    if plan.mode == "smart":
+        return f"头尾重编码 {plan.video_encoder}"
+    if plan.mode == "copy":
+        return "关键帧无损"
+    return f"精确 {plan.video_encoder}"
 
 
 def build_cut_command(
@@ -729,16 +1128,18 @@ def build_cut_command(
     end: float,
     overwrite: bool,
     reencode: bool = False,
+    video_encoder: str | None = None,
 ) -> list[str]:
     base = [ffmpeg, "-hide_banner", "-loglevel", "error"]
     base.append("-y" if overwrite else "-n")
     if reencode:
-        return [
+        video_args = build_video_encoder_args(video_encoder or "libx264")
+        cmd = [
             *base,
-            "-ss",
-            format_seconds(start),
             "-i",
             str(source),
+            "-ss",
+            format_seconds(start),
             "-t",
             format_seconds(max(0.0, end - start)),
             "-map",
@@ -747,24 +1148,18 @@ def build_cut_command(
             "0:a?",
             "-map",
             "0:s?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
+            *video_args,
             "-c:a",
             "aac",
             "-b:a",
             "192k",
             "-c:s",
             "copy",
-            "-movflags",
-            "+faststart",
             str(output),
         ]
+        if should_use_faststart(output):
+            cmd[-1:-1] = ["-movflags", "+faststart"]
+        return cmd
     return [
         *base,
         "-ss",
@@ -781,6 +1176,188 @@ def build_cut_command(
         "make_zero",
         str(output),
     ]
+
+
+def build_video_encoder_args(video_encoder: str) -> list[str]:
+    if video_encoder == "libx264":
+        return [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+    return [
+        "-c:v",
+        video_encoder,
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+
+def should_use_faststart(output: Path) -> bool:
+    return output.suffix.lower() in {".mp4", ".m4v", ".mov"}
+
+
+def build_smart_copy_command(ffmpeg: str, source: Path, output: Path, start: float, end: float, overwrite: bool) -> list[str]:
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y" if overwrite else "-n",
+        "-ss",
+        format_seconds(start),
+        "-to",
+        format_seconds(end),
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        str(output),
+    ]
+
+
+def build_concat_command(ffmpeg: str, list_file: Path, output: Path, overwrite: bool) -> list[str]:
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y" if overwrite else "-n",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_file),
+        "-c",
+        "copy",
+        str(output),
+    ]
+    if should_use_faststart(output):
+        cmd[-1:-1] = ["-movflags", "+faststart"]
+    return cmd
+
+
+def build_smart_render_commands(
+    plan: CutPlan,
+    ffmpeg: str,
+    source: Path,
+    output: Path,
+    overwrite: bool,
+) -> tuple[list[list[str]], list[Path]]:
+    temp_root = Path(tempfile.mkdtemp(prefix=f"{source.stem}_smart_", dir=str(output.parent)))
+    commands: list[list[str]] = []
+    segment_paths: list[Path] = []
+    for index, segment in enumerate(plan.segments, start=1):
+        segment_path = temp_root / f"{index:02d}_{segment.label}.mkv"
+        if segment.mode == "copy":
+            command = build_smart_copy_command(ffmpeg, source, segment_path, segment.start, segment.end, overwrite=True)
+        else:
+            command = build_cut_command(
+                ffmpeg,
+                source,
+                segment_path,
+                segment.start,
+                segment.end,
+                overwrite=True,
+                reencode=True,
+                video_encoder=plan.video_encoder,
+            )
+        commands.append(command)
+        segment_paths.append(segment_path)
+    list_file = temp_root / "concat.txt"
+    list_file.write_text("".join(f"file {format_concat_path(path)}\n" for path in segment_paths), encoding="utf-8", newline="\n")
+    commands.append(build_concat_command(ffmpeg, list_file, output, overwrite))
+    return commands, [temp_root]
+
+
+def execute_cut_plan(
+    plan: CutPlan,
+    tools: ToolPaths,
+    source: Path,
+    output: Path,
+    overwrite: bool,
+    dry_run: bool,
+) -> list[list[str]]:
+    active_plan = plan
+    fallback_enabled = plan.video_encoder not in (None, "libx264") and plan.mode in {"precise", "smart"}
+    attempted_fallback = False
+    while True:
+        try:
+            return _execute_cut_plan_once(active_plan, tools, source, output, overwrite, dry_run)
+        except ToolError:
+            if dry_run or not fallback_enabled or attempted_fallback:
+                raise
+            active_plan = replace_cut_plan_video_encoder(active_plan, "libx264")
+            attempted_fallback = True
+
+
+def _execute_cut_plan_once(
+    plan: CutPlan,
+    tools: ToolPaths,
+    source: Path,
+    output: Path,
+    overwrite: bool,
+    dry_run: bool,
+) -> list[list[str]]:
+    cleanup_paths: list[Path] = []
+    if plan.mode == "smart":
+        commands, cleanup_paths = build_smart_render_commands(plan, tools.ffmpeg, source, output, overwrite)
+    else:
+        commands = [
+            build_cut_command(
+                tools.ffmpeg,
+                source,
+                output,
+                plan.actual_start,
+                plan.actual_end,
+                overwrite,
+                reencode=plan.mode == "precise",
+                video_encoder=plan.video_encoder,
+            )
+        ]
+    try:
+        if not dry_run:
+            for command in commands:
+                run_command(command, capture=False)
+        return commands
+    finally:
+        for cleanup_path in cleanup_paths:
+            shutil.rmtree(cleanup_path, ignore_errors=True)
+
+
+def replace_cut_plan_video_encoder(plan: CutPlan, video_encoder: str) -> CutPlan:
+    return CutPlan(
+        mode=plan.mode,
+        decision=plan.decision,
+        requested_start=plan.requested_start,
+        requested_end=plan.requested_end,
+        actual_start=plan.actual_start,
+        actual_end=plan.actual_end,
+        keyframe_start=plan.keyframe_start,
+        keyframe_end=plan.keyframe_end,
+        start_delta=plan.start_delta,
+        end_delta=plan.end_delta,
+        alignment_available=plan.alignment_available,
+        video_encoder=video_encoder,
+        segments=plan.segments,
+        fallback_reason=plan.fallback_reason,
+    )
+
+
+def format_concat_path(path: Path) -> str:
+    return "'" + str(path).replace("'", r"'\''") + "'"
 
 
 def output_path_for_source(output_dir: Path | None, source: Path, overwrite: bool) -> Path:
@@ -902,7 +1479,12 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             self.busy = False
             self.front_scan_seconds = DEFAULT_SCAN_SECONDS
             self.back_scan_seconds = DEFAULT_SCAN_SECONDS
+            self.scene_threshold = DEFAULT_SCENE_THRESHOLD
+            self.min_segment_seconds = DEFAULT_MIN_SEGMENT_SECONDS
+            self.max_segments_per_side = DEFAULT_MAX_SEGMENTS_PER_SIDE
             self.cut_output_dir: Path | None = None
+            self.auto_reencode_threshold = DEFAULT_AUTO_REENCODE_THRESHOLD
+            self.smart_render_var = tk.BooleanVar(value=False)
             self.reencode_output_var = tk.BooleanVar(value=False)
             self._build()
             if self.dnd_enabled:
@@ -942,6 +1524,19 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             ttk.Entry(top, textvariable=self.output_dir_var).grid(row=1, column=1, columnspan=8, sticky="ew", pady=(8, 0), padx=(6, 6))
             ttk.Button(top, text="选择输出目录", command=self._choose_output_dir).grid(row=1, column=9, sticky="w", pady=(8, 0))
             ttk.Label(top, text="留空则保存到原视频目录").grid(row=1, column=10, sticky="w", pady=(8, 0))
+            ttk.Label(top, text="最短片段(秒)").grid(row=2, column=0, sticky="w", pady=(8, 0))
+            self.min_segment_seconds_var = tk.StringVar(value=format_seconds(DEFAULT_MIN_SEGMENT_SECONDS))
+            ttk.Entry(top, textvariable=self.min_segment_seconds_var, width=6).grid(row=2, column=1, sticky="w", pady=(8, 0))
+            ttk.Label(top, text="每侧最大候选").grid(row=2, column=2, sticky="w", padx=(10, 4), pady=(8, 0))
+            self.max_segments_per_side_var = tk.StringVar(value=str(DEFAULT_MAX_SEGMENTS_PER_SIDE))
+            ttk.Entry(top, textvariable=self.max_segments_per_side_var, width=6).grid(row=2, column=3, sticky="w", pady=(8, 0))
+            ttk.Label(top, text="切点灵敏度").grid(row=2, column=4, sticky="w", padx=(10, 4), pady=(8, 0))
+            self.scene_threshold_var = tk.StringVar(value=format_seconds(DEFAULT_SCENE_THRESHOLD))
+            ttk.Entry(top, textvariable=self.scene_threshold_var, width=6).grid(row=2, column=5, sticky="w", pady=(8, 0))
+            ttk.Label(
+                top,
+                text="灵敏度越低切得越细；最短片段越小切得越细；候选数越大保留越多",
+            ).grid(row=2, column=6, columnspan=5, sticky="w", padx=(10, 0), pady=(8, 0))
             if self.dnd_enabled:
                 self.drop_label = ttk.Label(
                     self.root,
@@ -994,7 +1589,12 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             ttk.Entry(bottom, textvariable=self.back_offset_var, width=8).pack(side="left", padx=(4, 12))
             ttk.Button(bottom, text="保存当前选择", command=self._save_current_selection).pack(side="left")
             ttk.Button(bottom, text="应用当前选择到全部视频", command=self._apply_current_selection_to_all).pack(side="left", padx=(8, 0))
-            ttk.Checkbutton(bottom, text="精准生成(慢速/避免花屏)", variable=self.reencode_output_var).pack(side="left", padx=(12, 0))
+            ttk.Checkbutton(bottom, text="头尾精确重编码(推荐)", variable=self.smart_render_var).pack(side="left", padx=(12, 0))
+            ttk.Checkbutton(bottom, text="始终精确生成(慢)", variable=self.reencode_output_var).pack(side="left", padx=(12, 0))
+            ttk.Label(
+                bottom,
+                text="普通模式: 关键帧无损，速度最快；勾选后只重编码头尾",
+            ).pack(side="left", padx=(12, 0))
 
         def _resize_canvas_window(self, event: Any) -> None:
             self.canvas.itemconfigure(self.canvas_window, width=event.width)
@@ -1105,11 +1705,26 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
                 return
             front_minutes = parse_float(self.front_scan_minutes_var.get(), 5.0)
             back_minutes = parse_float(self.back_scan_minutes_var.get(), 5.0)
+            scene_threshold = parse_float(self.scene_threshold_var.get(), DEFAULT_SCENE_THRESHOLD)
+            min_segment_seconds = parse_float(self.min_segment_seconds_var.get(), DEFAULT_MIN_SEGMENT_SECONDS)
+            max_segments_per_side = parse_int(self.max_segments_per_side_var.get(), DEFAULT_MAX_SEGMENTS_PER_SIDE)
             if front_minutes <= 0 or back_minutes <= 0:
                 messagebox.showwarning("提示", "片头/片尾范围必须大于 0 分钟。")
                 return
+            if scene_threshold <= 0:
+                messagebox.showwarning("提示", "切点灵敏度必须大于 0。")
+                return
+            if min_segment_seconds <= 0:
+                messagebox.showwarning("提示", "最短片段秒数必须大于 0。")
+                return
+            if max_segments_per_side <= 0:
+                messagebox.showwarning("提示", "每侧最大候选数必须大于 0。")
+                return
             self.front_scan_seconds = front_minutes * 60
             self.back_scan_seconds = back_minutes * 60
+            self.scene_threshold = scene_threshold
+            self.min_segment_seconds = min_segment_seconds
+            self.max_segments_per_side = max_segments_per_side
             self.session_dir = self.output_root / f"gui_session_{time.strftime('%Y%m%d_%H%M%S')}"
             self.session_dir.mkdir(parents=True, exist_ok=True)
             self.busy = True
@@ -1124,10 +1739,10 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
                 tools=self.tools,
                 scan_seconds=self.front_scan_seconds,
                 back_scan_seconds=self.back_scan_seconds,
-                scene_threshold=DEFAULT_SCENE_THRESHOLD,
-                min_segment_seconds=DEFAULT_MIN_SEGMENT_SECONDS,
+                scene_threshold=self.scene_threshold,
+                min_segment_seconds=self.min_segment_seconds,
                 merge_gap_seconds=DEFAULT_MERGE_GAP_SECONDS,
-                max_segments_per_side=DEFAULT_MAX_SEGMENTS_PER_SIDE,
+                max_segments_per_side=self.max_segments_per_side,
                 progress=lambda ordinal, total, video: self._ui(lambda: self._set_status(f"正在分析 {ordinal}/{total}: {video.name}")),
             )
             write_analysis_files(self.session_dir, manifest)
@@ -1317,20 +1932,28 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
                 if unchanged:
                     results.append(f"跳过 {source.name}: 无片头/片尾广告")
                     continue
-                if self.reencode_output_var.get():
-                    start = requested_start
-                    end = requested_end
-                else:
-                    start = find_nearest_keyframe(source, requested_start, self.tools, prefer="before")
-                    end = find_nearest_keyframe(source, requested_end, self.tools, prefer="after")
-                if end <= start:
+                plan = choose_cut_plan(
+                    source=source,
+                    requested_start=requested_start,
+                    requested_end=requested_end,
+                    tools=self.tools,
+                    force_precise=self.reencode_output_var.get(),
+                    prefer_smart_edges=self.smart_render_var.get() and not self.reencode_output_var.get(),
+                    auto_reencode_threshold=self.auto_reencode_threshold,
+                )
+                if plan.actual_end <= plan.actual_start:
                     results.append(f"跳过 {source.name}: 裁剪范围无效")
                     continue
                 output = timestamped_output_path_for_source(self.cut_output_dir, source, overwrite=False, timestamp=timestamp)
-                cmd = build_cut_command(self.tools.ffmpeg, source, output, start, end, overwrite=False, reencode=self.reencode_output_var.get())
-                self._ui(lambda name=source.name: self._set_status(f"正在生成: {name}"))
-                run_command(cmd, capture=False)
-                results.append(f"{output} ({format_file_size(output.stat().st_size)})")
+                self._ui(
+                    lambda name=source.name, mode=format_gui_cut_plan_mode(plan): self._set_status(f"正在生成: {name} ({mode})")
+                )
+                execute_cut_plan(plan, self.tools, source, output, overwrite=False, dry_run=False)
+                results.append(
+                    f"{output} ({format_file_size(output.stat().st_size)}) | 模式:{format_gui_cut_plan_mode(plan)} | "
+                    f"选择:{format_timestamp(plan.requested_start)}-{format_timestamp(plan.requested_end)} | "
+                    f"输出:{format_timestamp(plan.actual_start)}-{format_timestamp(plan.actual_end)}"
+                )
             self._ui(lambda: self._show_cut_results(results))
 
         def _show_cut_results(self, results: list[str]) -> None:
@@ -1381,6 +2004,13 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
 def parse_float(value: str, default: float) -> float:
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_int(value: str, default: int) -> int:
+    try:
+        return int(float(value))
     except (TypeError, ValueError):
         return default
 
@@ -1559,6 +2189,8 @@ REVIEW_HTML_TEMPLATE = r"""<!doctype html>
     const manifest = JSON.parse(document.getElementById('manifest').textContent);
     const selections = new Map();
     const status = document.getElementById('status');
+    const app = document.getElementById('app');
+    const cards = new Map();
 
     function fmt(seconds) {
       seconds = Math.max(0, Number(seconds) || 0);
@@ -1598,7 +2230,7 @@ REVIEW_HTML_TEMPLATE = r"""<!doctype html>
       `;
       button.addEventListener('click', () => {
         selection[side + 'Index'] = selection[side + 'Index'] === segment.index ? null : segment.index;
-        render();
+        rerenderItem(item);
       });
       return button;
     }
@@ -1627,16 +2259,17 @@ REVIEW_HTML_TEMPLATE = r"""<!doctype html>
       section.appendChild(strip);
       section.querySelector('[data-clear]').addEventListener('click', () => {
         selection[side + 'Index'] = null;
-        render();
+        rerenderItem(item);
       });
       for (const button of section.querySelectorAll('[data-nudge]')) {
         button.addEventListener('click', () => {
           selection[offsetName] += Number(button.dataset.value);
-          render();
+          rerenderItem(item);
         });
       }
       section.querySelector('[data-offset]').addEventListener('change', event => {
         selection[offsetName] = Number(event.target.value) || 0;
+        rerenderItem(item);
       });
       return section;
     }
@@ -1645,6 +2278,7 @@ REVIEW_HTML_TEMPLATE = r"""<!doctype html>
       const selection = ensureSelection(item);
       const article = document.createElement('article');
       article.className = 'video';
+      article.dataset.itemId = item.id;
       article.innerHTML = `
         <div class="video-head">
           <div>
@@ -1658,12 +2292,25 @@ REVIEW_HTML_TEMPLATE = r"""<!doctype html>
       `;
       article.appendChild(renderSide(item, 'front', '片头：选择真正正片开始的片段'));
       article.appendChild(renderSide(item, 'back', '片尾：选择真正正片结束的片段'));
+      cards.set(item.id, article);
       return article;
     }
 
+    function rerenderItem(item) {
+      const currentArticle = cards.get(item.id);
+      const nextArticle = renderVideo(item);
+      if (currentArticle && currentArticle.isConnected) {
+        currentArticle.replaceWith(nextArticle);
+      } else {
+        app.appendChild(nextArticle);
+      }
+      cards.set(item.id, nextArticle);
+      status.textContent = summaryText();
+    }
+
     function render() {
-      const app = document.getElementById('app');
       app.innerHTML = '';
+      cards.clear();
       for (const item of manifest.items) {
         app.appendChild(renderVideo(item));
       }

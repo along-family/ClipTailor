@@ -28,10 +28,19 @@ class CutPlanTests(unittest.TestCase):
         self.assertAlmostEqual(plan.actual_end, 95.3)
         self.assertIsNone(plan.video_encoder)
 
+    @patch("video_ad_trimmer.get_preferred_video_encoder", return_value="h264_nvenc")
+    @patch("video_ad_trimmer.probe_source_profile", return_value=vat.SourceProfile("h264", "aac", 1, 0))
+    @patch(
+        "video_ad_trimmer.find_nearest_keyframe",
+        side_effect=[(15.0, True), (90.0, True)],
+    )
     @patch("video_ad_trimmer.resolve_keyframe_range", return_value=(3.0, 95.3, True))
-    def test_choose_cut_plan_keeps_copy_when_drift_exceeds_threshold_without_smart_or_precise(
+    def test_choose_cut_plan_auto_smart_when_drift_exceeds_threshold(
         self,
         _resolve_keyframe_range: object,
+        _find_nearest_keyframe: object,
+        _probe_source_profile: object,
+        _get_preferred_video_encoder: object,
     ) -> None:
         plan = vat.choose_cut_plan(
             source=self.source,
@@ -43,10 +52,12 @@ class CutPlanTests(unittest.TestCase):
             auto_reencode_threshold=0.5,
         )
 
-        self.assertEqual(plan.mode, "copy")
-        self.assertEqual(plan.decision, "copy")
-        self.assertAlmostEqual(plan.actual_start, 3.0)
-        self.assertAlmostEqual(plan.actual_end, 95.3)
+        self.assertEqual(plan.mode, "smart")
+        self.assertEqual(plan.decision, "smart")
+        self.assertAlmostEqual(plan.actual_start, 13.0)
+        self.assertAlmostEqual(plan.actual_end, 95.0)
+        self.assertEqual([segment.label for segment in plan.segments], ["head", "middle", "tail"])
+        self.assertEqual(plan.video_encoder, "h264_nvenc")
 
     @patch("video_ad_trimmer.get_preferred_video_encoder", return_value="libx264")
     @patch("video_ad_trimmer.resolve_keyframe_range", return_value=(13.0, 95.0, True))
@@ -212,6 +223,8 @@ class CommandBuilderTests(unittest.TestCase):
         second_plan = mock_execute_once.call_args_list[1].args[0]
         self.assertEqual(first_plan.video_encoder, "h264_nvenc")
         self.assertEqual(second_plan.video_encoder, "libx264")
+        self.assertFalse(mock_execute_once.call_args_list[0].args[4])
+        self.assertTrue(mock_execute_once.call_args_list[1].args[4])
 
     def test_pick_preferred_video_encoder_uses_priority_order(self) -> None:
         available = {"h264_amf", "libx264", "h264_qsv"}

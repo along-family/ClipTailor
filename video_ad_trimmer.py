@@ -816,6 +816,18 @@ def choose_cut_plan(
             end_delta=end_delta,
             tools=tools,
         )
+    if alignment_available and max(start_delta, end_delta) > auto_reencode_threshold:
+        return choose_smart_cut_plan(
+            source=source,
+            requested_start=requested_start,
+            requested_end=requested_end,
+            keyframe_start=keyframe_start,
+            keyframe_end=keyframe_end,
+            alignment_available=alignment_available,
+            start_delta=start_delta,
+            end_delta=end_delta,
+            tools=tools,
+        )
     return CutPlan(
         mode="copy",
         decision="copy",
@@ -1104,6 +1116,8 @@ def format_cut_plan_summary(plan: CutPlan) -> str:
         reason = "forced exact"
     elif plan.mode == "precise" and plan.decision == "fallback":
         reason = f"exact fallback, {plan.fallback_reason or 'smart render unavailable'}"
+    elif plan.mode == "precise" and plan.decision == "auto":
+        reason = f"auto exact, drift {format_seconds(max(plan.start_delta, plan.end_delta))}s"
     elif plan.mode == "precise":
         reason = f"auto exact, drift {format_seconds(max(plan.start_delta, plan.end_delta))}s"
     else:
@@ -1291,15 +1305,18 @@ def execute_cut_plan(
     dry_run: bool,
 ) -> list[list[str]]:
     active_plan = plan
+    active_overwrite = overwrite
     fallback_enabled = plan.video_encoder not in (None, "libx264") and plan.mode in {"precise", "smart"}
     attempted_fallback = False
     while True:
         try:
-            return _execute_cut_plan_once(active_plan, tools, source, output, overwrite, dry_run)
+            return _execute_cut_plan_once(active_plan, tools, source, output, active_overwrite, dry_run)
         except ToolError:
             if dry_run or not fallback_enabled or attempted_fallback:
                 raise
             active_plan = replace_cut_plan_video_encoder(active_plan, "libx264")
+            remove_zero_byte_file(output)
+            active_overwrite = True
             attempted_fallback = True
 
 
@@ -1330,11 +1347,23 @@ def _execute_cut_plan_once(
     try:
         if not dry_run:
             for command in commands:
-                run_command(command, capture=False)
+                try:
+                    run_command(command, capture=False)
+                except ToolError:
+                    remove_zero_byte_file(output)
+                    raise
         return commands
     finally:
         for cleanup_path in cleanup_paths:
             shutil.rmtree(cleanup_path, ignore_errors=True)
+
+
+def remove_zero_byte_file(path: Path) -> None:
+    try:
+        if path.is_file() and path.stat().st_size == 0:
+            path.unlink()
+    except OSError:
+        pass
 
 
 def replace_cut_plan_video_encoder(plan: CutPlan, video_encoder: str) -> CutPlan:
@@ -1797,9 +1826,9 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             if unchanged:
                 range_text = "未设置裁剪"
             elif selection.get("frontTimeSeconds") is not None or selection.get("backTimeSeconds") is not None:
-                range_text = f"批量时间范围 {format_timestamp(start)} - {format_timestamp(end)}"
+                range_text = f"批量时间范围 {format_timestamp(start)} - {format_timestamp(end)} | 时长 {format_timestamp(end - start)}"
             else:
-                range_text = f"选择范围 {format_timestamp(start)} - {format_timestamp(end)}"
+                range_text = f"选择范围 {format_timestamp(start)} - {format_timestamp(end)} | 时长 {format_timestamp(end - start)}"
             self.detail_var.set(f"{item['name']} | {format_timestamp(float(item['duration']))} | {range_text}")
 
             self._render_side(item, selection, "front", "片头：选择真正正片开始的片段", 0)
@@ -1951,6 +1980,7 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
                 execute_cut_plan(plan, self.tools, source, output, overwrite=False, dry_run=False)
                 results.append(
                     f"{output} ({format_file_size(output.stat().st_size)}) | 模式:{format_gui_cut_plan_mode(plan)} | "
+                    f"最终时长:{format_timestamp(plan.actual_end - plan.actual_start)} | "
                     f"选择:{format_timestamp(plan.requested_start)}-{format_timestamp(plan.requested_end)} | "
                     f"输出:{format_timestamp(plan.actual_start)}-{format_timestamp(plan.actual_end)}"
                 )

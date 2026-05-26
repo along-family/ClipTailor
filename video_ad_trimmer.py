@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -49,19 +50,24 @@ VIDEO_EXTENSIONS = {
 
 DEFAULT_SCAN_SECONDS = 5 * 60
 DEFAULT_SCENE_THRESHOLD = 0.32
-DEFAULT_MIN_SEGMENT_SECONDS = 6.0
-DEFAULT_MERGE_GAP_SECONDS = 1.0
+MIN_SEGMENT_SECONDS = 0.5
+DEFAULT_MIN_SEGMENT_SECONDS = 0.5
+DEFAULT_MERGE_GAP_SECONDS = 0.5
 DEFAULT_MAX_SEGMENTS_PER_SIDE = 45
 DEFAULT_GUI_OUTPUT_ROOT = "ad_trim_output"
+LOG_FILE_NAME = "cliptailor.log"
 DEFAULT_AUTO_REENCODE_THRESHOLD = 0.5
 KEYFRAME_SEARCH_WINDOW_SECONDS = 120.0
 SMART_RENDER_MIN_COPY_SECONDS = 1.0
+FAST_PRECISE_SEEK_MARGIN_SECONDS = 8.0
+OUTPUT_DURATION_TOLERANCE_SECONDS = 0.75
 PREFERRED_VIDEO_ENCODERS = ("h264_nvenc", "h264_qsv", "h264_amf", "libx264")
 PORTABLE_TOOL_DIRS = (
     Path("ffmpeg") / "bin",
     Path("tools") / "ffmpeg" / "bin",
     Path("_internal") / "ffmpeg" / "bin",
 )
+LOGGER = logging.getLogger("cliptailor")
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,10 @@ class CutPlan:
 
 
 class ToolError(RuntimeError):
+    pass
+
+
+class OutputDurationMismatch(ToolError):
     pass
 
 
@@ -290,9 +300,56 @@ def resolve_executable(value: str) -> str | None:
     return shutil.which(value)
 
 
+def configure_logging(log_path: Path | None) -> Path | None:
+    if log_path is None:
+        return None
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    resolved = log_path.resolve()
+    for handler in LOGGER.handlers:
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename).resolve() == resolved:
+            return log_path
+    for handler in list(LOGGER.handlers):
+        if isinstance(handler, logging.FileHandler):
+            LOGGER.removeHandler(handler)
+            handler.close()
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOGGER.addHandler(handler)
+    LOGGER.info("logging started: %s", log_path)
+    return log_path
+
+
+def log_info(message: str, *args: Any) -> None:
+    if LOGGER.handlers:
+        LOGGER.info(message, *args)
+
+
+def log_error(message: str, *args: Any) -> None:
+    if LOGGER.handlers:
+        LOGGER.error(message, *args)
+
+
 def analyze_videos(args: argparse.Namespace, tools: ToolPaths) -> None:
     input_path = Path(args.input).expanduser().resolve()
     output_dir = Path(args.output).expanduser().resolve()
+    log_path = configure_logging(output_dir / LOG_FILE_NAME)
+    if log_path:
+        print(f"log: {log_path}")
+    log_info(
+        "analyze start input=%s output=%s scan=%s scene_threshold=%s min_segment=%s merge_gap=%s max_segments=%s recursive=%s",
+        input_path,
+        output_dir,
+        args.scan_seconds,
+        args.scene_threshold,
+        args.min_segment_seconds,
+        args.merge_gap_seconds,
+        args.max_segments_per_side,
+        args.recursive,
+    )
+    if args.min_segment_seconds < MIN_SEGMENT_SECONDS:
+        raise ToolError(f"--min-segment-seconds must be at least {format_seconds(MIN_SEGMENT_SECONDS)}.")
     if output_dir.exists() and args.overwrite:
         remove_analysis_output(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -616,6 +673,20 @@ def extract_frame(video: Path, seconds: float, output: Path, tools: ToolPaths) -
 def cut_videos(args: argparse.Namespace, tools: ToolPaths) -> None:
     manifest_path = Path(args.manifest).expanduser().resolve()
     selections_path = Path(args.selections).expanduser().resolve()
+    log_path = configure_logging(manifest_path.parent / LOG_FILE_NAME)
+    if log_path:
+        print(f"log: {log_path}")
+    log_info(
+        "cut start manifest=%s selections=%s output=%s overwrite=%s reencode=%s smart_render_edges=%s auto_threshold=%s dry_run=%s",
+        manifest_path,
+        selections_path,
+        args.output,
+        args.overwrite,
+        args.reencode,
+        args.smart_render_edges,
+        args.auto_reencode_threshold,
+        args.dry_run,
+    )
     manifest = read_json(manifest_path)
     selections = read_json(selections_path)
     output_dir = Path(args.output).expanduser().resolve() if args.output else None
@@ -630,8 +701,18 @@ def cut_videos(args: argparse.Namespace, tools: ToolPaths) -> None:
             continue
         source = Path(item["source"])
         requested_start, requested_end, unchanged = compute_requested_range(item, selected)
+        log_info(
+            "selection source=%s start=%s end=%s duration=%s unchanged=%s selection=%s",
+            source,
+            format_timestamp(requested_start),
+            format_timestamp(requested_end),
+            format_timestamp(max(0.0, requested_end - requested_start)),
+            unchanged,
+            json.dumps(selected, ensure_ascii=False, sort_keys=True),
+        )
         if unchanged and not args.copy_unchanged:
             print(f"skip {item['name']}: no ads selected, source will stay unchanged")
+            log_info("skip source=%s reason=no ads selected", source)
             continue
         plan = choose_cut_plan(
             source=source,
@@ -655,6 +736,7 @@ def cut_videos(args: argparse.Namespace, tools: ToolPaths) -> None:
             continue
         print(f"cut {source.name}: {format_cut_plan_summary(plan)}")
         execute_cut_plan(plan, tools, source, output, args.overwrite, dry_run=False)
+        log_info("cut wrote source=%s output=%s size=%s", source, output, output.stat().st_size)
         print(f"  wrote {output} ({format_file_size(output.stat().st_size)})")
 
 
@@ -1147,13 +1229,17 @@ def build_cut_command(
     base = [ffmpeg, "-hide_banner", "-loglevel", "error"]
     base.append("-y" if overwrite else "-n")
     if reencode:
+        input_seek = max(0.0, start - FAST_PRECISE_SEEK_MARGIN_SECONDS)
+        output_seek = max(0.0, start - input_seek)
         video_args = build_video_encoder_args(video_encoder or "libx264")
         cmd = [
             *base,
+            "-ss",
+            format_seconds(input_seek),
             "-i",
             str(source),
             "-ss",
-            format_seconds(start),
+            format_seconds(output_seek),
             "-t",
             format_seconds(max(0.0, end - start)),
             "-map",
@@ -1178,10 +1264,10 @@ def build_cut_command(
         *base,
         "-ss",
         format_seconds(start),
-        "-to",
-        format_seconds(end),
         "-i",
         str(source),
+        "-t",
+        format_seconds(max(0.0, end - start)),
         "-map",
         "0",
         "-c",
@@ -1225,10 +1311,10 @@ def build_smart_copy_command(ffmpeg: str, source: Path, output: Path, start: flo
         "-y" if overwrite else "-n",
         "-ss",
         format_seconds(start),
-        "-to",
-        format_seconds(end),
         "-i",
         str(source),
+        "-t",
+        format_seconds(max(0.0, end - start)),
         "-map",
         "0:v:0",
         "-map",
@@ -1306,18 +1392,44 @@ def execute_cut_plan(
 ) -> list[list[str]]:
     active_plan = plan
     active_overwrite = overwrite
-    fallback_enabled = plan.video_encoder not in (None, "libx264") and plan.mode in {"precise", "smart"}
-    attempted_fallback = False
+    attempted_encoder_fallback = False
+    attempted_duration_fallback = False
+    log_info("execute start source=%s output=%s overwrite=%s dry_run=%s plan=%s", source, output, overwrite, dry_run, format_cut_plan_summary(plan))
     while True:
         try:
-            return _execute_cut_plan_once(active_plan, tools, source, output, active_overwrite, dry_run)
-        except ToolError:
-            if dry_run or not fallback_enabled or attempted_fallback:
+            commands = _execute_cut_plan_once(active_plan, tools, source, output, active_overwrite, dry_run)
+            if not dry_run:
+                verify_output_duration(active_plan, tools, output)
+            log_info("execute done source=%s output=%s plan_mode=%s", source, output, active_plan.mode)
+            return commands
+        except OutputDurationMismatch as exc:
+            log_error("duration mismatch source=%s output=%s error=%s", source, output, exc)
+            if dry_run or active_plan.mode == "precise" or attempted_duration_fallback:
+                raise
+            active_plan = build_precise_fallback_plan(
+                requested_start=plan.requested_start,
+                requested_end=plan.requested_end,
+                keyframe_start=plan.keyframe_start,
+                keyframe_end=plan.keyframe_end,
+                start_delta=plan.start_delta,
+                end_delta=plan.end_delta,
+                alignment_available=plan.alignment_available,
+                tools=tools,
+                reason="output duration mismatch",
+            )
+            log_info("retry precise fallback source=%s reason=output duration mismatch plan=%s", source, format_cut_plan_summary(active_plan))
+            active_overwrite = True
+            attempted_duration_fallback = True
+        except ToolError as exc:
+            log_error("execute failed source=%s output=%s plan_mode=%s error=%s", source, output, active_plan.mode, exc)
+            fallback_enabled = active_plan.video_encoder not in (None, "libx264") and active_plan.mode in {"precise", "smart"}
+            if dry_run or not fallback_enabled or attempted_encoder_fallback:
                 raise
             active_plan = replace_cut_plan_video_encoder(active_plan, "libx264")
             remove_zero_byte_file(output)
+            log_info("retry encoder fallback source=%s encoder=libx264 plan=%s", source, format_cut_plan_summary(active_plan))
             active_overwrite = True
-            attempted_fallback = True
+            attempted_encoder_fallback = True
 
 
 def _execute_cut_plan_once(
@@ -1347,6 +1459,7 @@ def _execute_cut_plan_once(
     try:
         if not dry_run:
             for command in commands:
+                log_info("run ffmpeg command=%s", format_command_for_log(command))
                 try:
                     run_command(command, capture=False)
                 except ToolError:
@@ -1356,6 +1469,26 @@ def _execute_cut_plan_once(
     finally:
         for cleanup_path in cleanup_paths:
             shutil.rmtree(cleanup_path, ignore_errors=True)
+
+
+def verify_output_duration(plan: CutPlan, tools: ToolPaths, output: Path) -> None:
+    expected_duration = max(0.0, plan.requested_end - plan.requested_start)
+    actual_duration = probe_duration(output, tools)
+    drift = abs(actual_duration - expected_duration)
+    log_info(
+        "verify duration output=%s expected=%s actual=%s drift=%s tolerance=%s",
+        output,
+        format_timestamp(expected_duration),
+        format_timestamp(actual_duration),
+        format_seconds(drift),
+        format_seconds(OUTPUT_DURATION_TOLERANCE_SECONDS),
+    )
+    if drift > OUTPUT_DURATION_TOLERANCE_SECONDS:
+        remove_zero_byte_file(output)
+        raise OutputDurationMismatch(
+            f"Output duration drift {format_seconds(drift)}s exceeds {format_seconds(OUTPUT_DURATION_TOLERANCE_SECONDS)}s: "
+            f"expected {format_timestamp(expected_duration)}, got {format_timestamp(actual_duration)}"
+        )
 
 
 def remove_zero_byte_file(path: Path) -> None:
@@ -1513,8 +1646,7 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             self.max_segments_per_side = DEFAULT_MAX_SEGMENTS_PER_SIDE
             self.cut_output_dir: Path | None = None
             self.auto_reencode_threshold = DEFAULT_AUTO_REENCODE_THRESHOLD
-            self.smart_render_var = tk.BooleanVar(value=False)
-            self.reencode_output_var = tk.BooleanVar(value=False)
+            self.cut_mode_var = tk.StringVar(value="smart")
             self._build()
             if self.dnd_enabled:
                 self._set_status("请选择视频/目录，或直接拖拽视频/目录到窗口。")
@@ -1618,11 +1750,28 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             ttk.Entry(bottom, textvariable=self.back_offset_var, width=8).pack(side="left", padx=(4, 12))
             ttk.Button(bottom, text="保存当前选择", command=self._save_current_selection).pack(side="left")
             ttk.Button(bottom, text="应用当前选择到全部视频", command=self._apply_current_selection_to_all).pack(side="left", padx=(8, 0))
-            ttk.Checkbutton(bottom, text="头尾精确重编码(推荐)", variable=self.smart_render_var).pack(side="left", padx=(12, 0))
-            ttk.Checkbutton(bottom, text="始终精确生成(慢)", variable=self.reencode_output_var).pack(side="left", padx=(12, 0))
+            ttk.Label(bottom, text="生成模式").pack(side="left", padx=(12, 4))
+            ttk.Radiobutton(
+                bottom,
+                text="推荐: 切点精确/中间复制",
+                variable=self.cut_mode_var,
+                value="smart",
+            ).pack(side="left")
+            ttk.Radiobutton(
+                bottom,
+                text="快速: 关键帧复制",
+                variable=self.cut_mode_var,
+                value="copy",
+            ).pack(side="left", padx=(8, 0))
+            ttk.Radiobutton(
+                bottom,
+                text="始终精确生成(慢)",
+                variable=self.cut_mode_var,
+                value="precise",
+            ).pack(side="left", padx=(8, 0))
             ttk.Label(
                 bottom,
-                text="普通模式: 关键帧无损，速度最快；勾选后只重编码头尾",
+                text="推荐模式默认选中；快速模式可能多出几秒，检测到偏差会自动兜底",
             ).pack(side="left", padx=(12, 0))
 
         def _resize_canvas_window(self, event: Any) -> None:
@@ -1743,8 +1892,8 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             if scene_threshold <= 0:
                 messagebox.showwarning("提示", "切点灵敏度必须大于 0。")
                 return
-            if min_segment_seconds <= 0:
-                messagebox.showwarning("提示", "最短片段秒数必须大于 0。")
+            if min_segment_seconds < MIN_SEGMENT_SECONDS:
+                messagebox.showwarning("提示", f"最短片段秒数必须至少为 {format_seconds(MIN_SEGMENT_SECONDS)}。")
                 return
             if max_segments_per_side <= 0:
                 messagebox.showwarning("提示", "每侧最大候选数必须大于 0。")
@@ -1756,8 +1905,19 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             self.max_segments_per_side = max_segments_per_side
             self.session_dir = self.output_root / f"gui_session_{time.strftime('%Y%m%d_%H%M%S')}"
             self.session_dir.mkdir(parents=True, exist_ok=True)
+            log_path = configure_logging(self.session_dir / LOG_FILE_NAME)
+            log_info(
+                "gui analyze start session=%s videos=%s front_scan=%s back_scan=%s scene_threshold=%s min_segment=%s max_segments=%s",
+                self.session_dir,
+                [str(video) for video in self.videos],
+                self.front_scan_seconds,
+                self.back_scan_seconds,
+                self.scene_threshold,
+                self.min_segment_seconds,
+                self.max_segments_per_side,
+            )
             self.busy = True
-            self._set_status("正在分析，请稍候...")
+            self._set_status(f"正在分析，请稍候... 日志: {log_path}")
             self._run_background(self._analyze_worker)
 
         def _analyze_worker(self) -> None:
@@ -1775,6 +1935,7 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
                 progress=lambda ordinal, total, video: self._ui(lambda: self._set_status(f"正在分析 {ordinal}/{total}: {video.name}")),
             )
             write_analysis_files(self.session_dir, manifest)
+            log_info("gui analyze done session=%s items=%s", self.session_dir, len(manifest.get("items", [])))
             self._ui(lambda: self._load_manifest(manifest))
 
         def _load_manifest(self, manifest: dict[str, Any]) -> None:
@@ -1954,20 +2115,31 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             assert self.manifest is not None
             results: list[str] = []
             timestamp = time.strftime("%Y%m%d_%H%M%S")
+            log_info("gui cut start session=%s mode=%s output_dir=%s", self.session_dir, self.cut_mode_var.get(), self.cut_output_dir)
             for item in self.manifest.get("items", []):
                 selection = self.selections[item["id"]]
                 source = Path(item["source"])
                 requested_start, requested_end, unchanged = compute_requested_range(item, selection)
+                log_info(
+                    "gui selection source=%s start=%s end=%s duration=%s unchanged=%s selection=%s",
+                    source,
+                    format_timestamp(requested_start),
+                    format_timestamp(requested_end),
+                    format_timestamp(max(0.0, requested_end - requested_start)),
+                    unchanged,
+                    json.dumps(selection, ensure_ascii=False, sort_keys=True),
+                )
                 if unchanged:
                     results.append(f"跳过 {source.name}: 无片头/片尾广告")
+                    log_info("gui skip source=%s reason=no ads selected", source)
                     continue
                 plan = choose_cut_plan(
                     source=source,
                     requested_start=requested_start,
                     requested_end=requested_end,
                     tools=self.tools,
-                    force_precise=self.reencode_output_var.get(),
-                    prefer_smart_edges=self.smart_render_var.get() and not self.reencode_output_var.get(),
+                    force_precise=self.cut_mode_var.get() == "precise",
+                    prefer_smart_edges=self.cut_mode_var.get() == "smart",
                     auto_reencode_threshold=self.auto_reencode_threshold,
                 )
                 if plan.actual_end <= plan.actual_start:
@@ -1978,6 +2150,7 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
                     lambda name=source.name, mode=format_gui_cut_plan_mode(plan): self._set_status(f"正在生成: {name} ({mode})")
                 )
                 execute_cut_plan(plan, self.tools, source, output, overwrite=False, dry_run=False)
+                log_info("gui cut wrote source=%s output=%s size=%s", source, output, output.stat().st_size)
                 results.append(
                     f"{output} ({format_file_size(output.stat().st_size)}) | 模式:{format_gui_cut_plan_mode(plan)} | "
                     f"最终时长:{format_timestamp(plan.actual_end - plan.actual_start)} | "
@@ -1988,6 +2161,8 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
 
         def _show_cut_results(self, results: list[str]) -> None:
             text = "\n".join(results) if results else "没有生成新视频。"
+            if self.session_dir:
+                text += f"\n\n日志文件: {self.session_dir / LOG_FILE_NAME}"
             self.busy = False
             self._set_status("处理完成。")
             messagebox.showinfo("处理完成", text)
@@ -2013,7 +2188,10 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
                 try:
                     target()
                 except Exception as exc:  # GUI boundary: surface all worker failures.
-                    self._ui(lambda: messagebox.showerror("错误", str(exc)))
+                    if LOGGER.handlers:
+                        LOGGER.exception("gui worker failed")
+                    log_path_text = f"\n\n日志文件: {self.session_dir / LOG_FILE_NAME}" if self.session_dir else ""
+                    self._ui(lambda: messagebox.showerror("错误", str(exc) + log_path_text))
                     self._ui(self._mark_error)
 
             threading.Thread(target=runner, daemon=True).start()
@@ -2435,6 +2613,7 @@ def run_command(cmd: list[str], capture: bool) -> subprocess.CompletedProcess[st
     run_kwargs: dict[str, Any] = {"check": False}
     if os.name == "nt":
         run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    log_info("command start capture=%s command=%s", capture, format_command_for_log(cmd))
     try:
         if capture:
             raw_result = subprocess.run(
@@ -2452,12 +2631,22 @@ def run_command(cmd: list[str], capture: bool) -> subprocess.CompletedProcess[st
         else:
             result = subprocess.run(cmd, **run_kwargs)
     except FileNotFoundError as exc:
+        log_error("command missing command=%s", format_command_for_log(cmd))
         raise ToolError(f"Command not found: {cmd[0]}") from exc
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
         stdout = (result.stdout or "").strip()
         detail = stderr or stdout or f"exit code {result.returncode}"
+        log_error("command failed code=%s command=%s detail=%s", result.returncode, format_command_for_log(cmd), detail[:4000])
         raise ToolError(f"Command failed: {' '.join(quote_arg(part) for part in cmd)}\n{detail}")
+    if capture and ((result.stdout or "").strip() or (result.stderr or "").strip()):
+        log_info(
+            "command output command=%s stdout=%s stderr=%s",
+            format_command_for_log(cmd),
+            (result.stdout or "").strip()[:4000],
+            (result.stderr or "").strip()[:4000],
+        )
+    log_info("command done code=%s command=%s", result.returncode, format_command_for_log(cmd))
     return result
 
 
@@ -2470,6 +2659,10 @@ def decode_process_output(data: bytes | None) -> str:
         except UnicodeDecodeError:
             continue
     return data.decode("utf-8", errors="replace")
+
+
+def format_command_for_log(cmd: list[str]) -> str:
+    return " ".join(quote_arg(part) for part in cmd)
 
 
 def write_json(path: Path, data: Any) -> None:

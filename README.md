@@ -50,7 +50,14 @@ py video_ad_trimmer.py gui
 海贼王1153_20260521_094322.mp4
 ```
 
-工具使用 `ffmpeg -c copy` 无损裁剪，不重新编码，也不会覆盖原视频。
+默认生成模式会尽量只重编码切点附近并复制中间片段；检测到输出时长明显偏差时会自动兜底为精确生成，不会覆盖原视频。
+
+## Logs
+
+- 桌面界面每次点击“开始分析”都会创建一个会话目录，例如 `ad_trim_output/gui_session_yyyyMMdd_HHmmss`。
+- 日志文件在该会话目录下：`cliptailor.log`。
+- 如果裁剪不准确，请保留这几个文件：`cliptailor.log`、`manifest.json`、`selections.json`。
+- 反馈时说明原视频文件名、你选择的开始/结束时间、实际输出时长，以及是否看到“自动兜底”相关结果。
 
 ## CLI Workflow
 
@@ -77,12 +84,12 @@ py video_ad_trimmer.py csv -m .\ad_trim_output\manifest.json -s .\ad_trim_output
 ## Useful Options
 
 ```powershell
-py video_ad_trimmer.py analyze .\videos -o .\ad_trim_output --scan-seconds 300 --scene-threshold 0.32 --min-segment-seconds 6
+py video_ad_trimmer.py analyze .\videos -o .\ad_trim_output --scan-seconds 300 --scene-threshold 0.32 --min-segment-seconds 0.5
 ```
 
 - `--scan-seconds`：分析片头/片尾多少秒，默认 300。
 - `--scene-threshold`：场景变化阈值，越低候选片段越多，默认 0.32。
-- `--min-segment-seconds`：短片段会合并到相邻片段，默认 6。
+- `--min-segment-seconds`：短片段会合并到相邻片段，默认 0.5。
 - `--max-segments-per-side`：每侧最多候选片段数，默认 45。
 
 ## Notes

@@ -11,7 +11,12 @@ class CutPlanTests(unittest.TestCase):
         self.source = Path("sample.mp4")
 
     @patch("video_ad_trimmer.resolve_keyframe_range", return_value=(13.2, 95.3, True))
-    def test_choose_cut_plan_keeps_copy_when_drift_within_threshold(self, _resolve_keyframe_range: object) -> None:
+    @patch("video_ad_trimmer.get_preferred_video_encoder")
+    def test_choose_cut_plan_keeps_copy_when_drift_within_threshold(
+        self,
+        _get_preferred_video_encoder: object,
+        _resolve_keyframe_range: object,
+    ) -> None:
         plan = vat.choose_cut_plan(
             source=self.source,
             requested_start=13.0,
@@ -27,6 +32,7 @@ class CutPlanTests(unittest.TestCase):
         self.assertAlmostEqual(plan.actual_start, 13.2)
         self.assertAlmostEqual(plan.actual_end, 95.3)
         self.assertIsNone(plan.video_encoder)
+        _get_preferred_video_encoder.assert_not_called()
 
     @patch("video_ad_trimmer.get_preferred_video_encoder", return_value="h264_nvenc")
     @patch("video_ad_trimmer.probe_source_profile", return_value=vat.SourceProfile("h264", "aac", 1, 0))
@@ -81,6 +87,28 @@ class CutPlanTests(unittest.TestCase):
         self.assertAlmostEqual(plan.actual_start, 13.0)
         self.assertAlmostEqual(plan.actual_end, 95.0)
         self.assertEqual(plan.video_encoder, "libx264")
+
+    @patch("video_ad_trimmer.get_preferred_video_encoder")
+    @patch("video_ad_trimmer.resolve_keyframe_range", return_value=(13.0, 95.0, True))
+    def test_choose_cut_plan_uses_explicit_video_encoder(
+        self,
+        _resolve_keyframe_range: object,
+        _get_preferred_video_encoder: object,
+    ) -> None:
+        plan = vat.choose_cut_plan(
+            source=self.source,
+            requested_start=13.0,
+            requested_end=95.0,
+            tools=self.tools,
+            force_precise=True,
+            prefer_smart_edges=False,
+            auto_reencode_threshold=0.5,
+            video_encoder="h264_amf",
+        )
+
+        self.assertEqual(plan.mode, "precise")
+        self.assertEqual(plan.video_encoder, "h264_amf")
+        _get_preferred_video_encoder.assert_not_called()
 
     @patch("video_ad_trimmer.get_preferred_video_encoder", return_value="h264_nvenc")
     @patch("video_ad_trimmer.probe_source_profile", return_value=vat.SourceProfile("h264", "aac", 1, 0))
@@ -268,28 +296,29 @@ class CommandBuilderTests(unittest.TestCase):
     @patch("video_ad_trimmer.probe_duration", side_effect=[85.2, 82.0])
     @patch("video_ad_trimmer._execute_cut_plan_once")
     @patch("video_ad_trimmer.get_preferred_video_encoder", return_value="libx264")
-    def test_execute_cut_plan_retries_precise_when_output_duration_drifts(
+    def test_execute_cut_plan_retries_precise_when_smart_output_duration_drifts(
         self,
         _get_preferred_video_encoder: object,
         mock_execute_once: object,
         _probe_duration: object,
     ) -> None:
         plan = vat.CutPlan(
-            mode="copy",
-            decision="copy",
+            mode="smart",
+            decision="smart",
             requested_start=13.0,
             requested_end=95.0,
             actual_start=13.0,
-            actual_end=98.0,
+            actual_end=95.0,
             keyframe_start=13.0,
             keyframe_end=98.0,
             start_delta=0.0,
             end_delta=3.0,
             alignment_available=True,
-            segments=(vat.RenderSegment("full", "copy", 13.0, 98.0),),
+            video_encoder="libx264",
+            segments=(vat.RenderSegment("full", "precise", 13.0, 95.0),),
         )
         mock_execute_once.side_effect = [
-            [["ffmpeg", "-c", "copy"]],
+            [["ffmpeg", "-c:v", "libx264"]],
             [["ffmpeg", "-c:v", "libx264"]],
         ]
 
@@ -307,6 +336,40 @@ class CommandBuilderTests(unittest.TestCase):
         self.assertEqual(retry_plan.mode, "precise")
         self.assertEqual(retry_plan.fallback_reason, "output duration mismatch")
         self.assertTrue(mock_execute_once.call_args_list[1].args[4])
+
+    @patch("video_ad_trimmer.probe_duration", return_value=85.2)
+    @patch("video_ad_trimmer._execute_cut_plan_once", return_value=[["ffmpeg", "-c", "copy"]])
+    def test_execute_cut_plan_allows_copy_duration_to_match_keyframe_range(
+        self,
+        mock_execute_once: object,
+        _probe_duration: object,
+    ) -> None:
+        plan = vat.CutPlan(
+            mode="copy",
+            decision="copy",
+            requested_start=13.0,
+            requested_end=95.0,
+            actual_start=13.0,
+            actual_end=98.0,
+            keyframe_start=13.0,
+            keyframe_end=98.0,
+            start_delta=0.0,
+            end_delta=3.0,
+            alignment_available=True,
+            segments=(vat.RenderSegment("full", "copy", 13.0, 98.0),),
+        )
+
+        commands = vat.execute_cut_plan(
+            plan,
+            vat.ToolPaths(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+            Path("input.mp4"),
+            Path("output.mp4"),
+            overwrite=False,
+            dry_run=False,
+        )
+
+        self.assertEqual(commands, [["ffmpeg", "-c", "copy"]])
+        self.assertEqual(mock_execute_once.call_count, 1)
 
     @patch("video_ad_trimmer.probe_duration", return_value=85.2)
     @patch("video_ad_trimmer._execute_cut_plan_once", return_value=[["ffmpeg"]])

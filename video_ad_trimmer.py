@@ -62,6 +62,7 @@ SMART_RENDER_MIN_COPY_SECONDS = 1.0
 FAST_PRECISE_SEEK_MARGIN_SECONDS = 8.0
 OUTPUT_DURATION_TOLERANCE_SECONDS = 0.75
 PREFERRED_VIDEO_ENCODERS = ("h264_nvenc", "h264_qsv", "h264_amf", "libx264")
+VIDEO_ENCODER_CHOICES = ("auto", *PREFERRED_VIDEO_ENCODERS)
 PORTABLE_TOOL_DIRS = (
     Path("ffmpeg") / "bin",
     Path("tools") / "ffmpeg" / "bin",
@@ -174,10 +175,16 @@ def main() -> int:
     cut.add_argument("--smart-render-edges", action="store_true", help="Re-encode only the cut edges and copy the middle section.")
     cut.add_argument("--reencode", action="store_true", help="Always re-encode output for exact cuts.")
     cut.add_argument(
+        "--video-encoder",
+        choices=VIDEO_ENCODER_CHOICES,
+        default="auto",
+        help="Video encoder for smart/exact render. auto prefers GPU encoders when available.",
+    )
+    cut.add_argument(
         "--auto-reencode-threshold",
         type=float,
-        default=DEFAULT_AUTO_REENCODE_THRESHOLD,
-        help="Auto-switch to exact re-encode when keyframe cuts drift more than this many seconds.",
+        default=None,
+        help="Auto-switch to smart render when keyframe cuts drift more than this many seconds. Disabled by default.",
     )
     cut.add_argument("--dry-run", action="store_true", help="Print ffmpeg commands without running them.")
 
@@ -714,6 +721,9 @@ def cut_videos(args: argparse.Namespace, tools: ToolPaths) -> None:
             print(f"skip {item['name']}: no ads selected, source will stay unchanged")
             log_info("skip source=%s reason=no ads selected", source)
             continue
+        auto_reencode_threshold = (
+            float("inf") if args.auto_reencode_threshold is None else max(0.0, float(args.auto_reencode_threshold))
+        )
         plan = choose_cut_plan(
             source=source,
             requested_start=requested_start,
@@ -721,7 +731,8 @@ def cut_videos(args: argparse.Namespace, tools: ToolPaths) -> None:
             tools=tools,
             force_precise=args.reencode,
             prefer_smart_edges=args.smart_render_edges,
-            auto_reencode_threshold=max(0.0, float(args.auto_reencode_threshold)),
+            auto_reencode_threshold=auto_reencode_threshold,
+            video_encoder=args.video_encoder,
             allow_missing_alignment=args.dry_run,
         )
         if plan.actual_end <= plan.actual_start:
@@ -859,6 +870,7 @@ def choose_cut_plan(
     force_precise: bool,
     prefer_smart_edges: bool,
     auto_reencode_threshold: float,
+    video_encoder: str = "auto",
     allow_missing_alignment: bool = False,
 ) -> CutPlan:
     keyframe_start, keyframe_end, alignment_available = resolve_keyframe_range(
@@ -871,6 +883,7 @@ def choose_cut_plan(
     start_delta = abs(keyframe_start - requested_start)
     end_delta = abs(keyframe_end - requested_end)
     if force_precise:
+        selected_video_encoder = resolve_video_encoder(tools, video_encoder)
         return CutPlan(
             mode="precise",
             decision="forced",
@@ -883,10 +896,11 @@ def choose_cut_plan(
             start_delta=start_delta,
             end_delta=end_delta,
             alignment_available=alignment_available,
-            video_encoder=get_preferred_video_encoder(tools.ffmpeg),
+            video_encoder=selected_video_encoder,
             segments=(RenderSegment("full", "precise", requested_start, requested_end),),
         )
     if prefer_smart_edges:
+        selected_video_encoder = resolve_video_encoder(tools, video_encoder)
         return choose_smart_cut_plan(
             source=source,
             requested_start=requested_start,
@@ -897,8 +911,10 @@ def choose_cut_plan(
             start_delta=start_delta,
             end_delta=end_delta,
             tools=tools,
+            video_encoder=selected_video_encoder,
         )
     if alignment_available and max(start_delta, end_delta) > auto_reencode_threshold:
+        selected_video_encoder = resolve_video_encoder(tools, video_encoder)
         return choose_smart_cut_plan(
             source=source,
             requested_start=requested_start,
@@ -909,6 +925,7 @@ def choose_cut_plan(
             start_delta=start_delta,
             end_delta=end_delta,
             tools=tools,
+            video_encoder=selected_video_encoder,
         )
     return CutPlan(
         mode="copy",
@@ -942,6 +959,7 @@ def choose_smart_cut_plan(
     start_delta: float,
     end_delta: float,
     tools: ToolPaths,
+    video_encoder: str,
 ) -> CutPlan:
     if not alignment_available:
         return build_precise_fallback_plan(
@@ -953,6 +971,7 @@ def choose_smart_cut_plan(
             end_delta=end_delta,
             alignment_available=alignment_available,
             tools=tools,
+            video_encoder=video_encoder,
             reason="keyframe unavailable",
         )
     try:
@@ -967,6 +986,7 @@ def choose_smart_cut_plan(
             end_delta=end_delta,
             alignment_available=alignment_available,
             tools=tools,
+            video_encoder=video_encoder,
             reason=str(exc),
         )
     compatible, reason = check_smart_render_compatibility(profile)
@@ -980,6 +1000,7 @@ def choose_smart_cut_plan(
             end_delta=end_delta,
             alignment_available=alignment_available,
             tools=tools,
+            video_encoder=video_encoder,
             reason=reason,
         )
     middle_start, middle_start_found = find_nearest_keyframe(source, requested_start, tools, prefer="after")
@@ -994,6 +1015,7 @@ def choose_smart_cut_plan(
             end_delta=end_delta,
             alignment_available=alignment_available,
             tools=tools,
+            video_encoder=video_encoder,
             reason="smart edges could not find inner keyframes",
         )
     segments: list[RenderSegment] = []
@@ -1011,6 +1033,7 @@ def choose_smart_cut_plan(
             end_delta=end_delta,
             alignment_available=alignment_available,
             tools=tools,
+            video_encoder=video_encoder,
             reason="middle copy section is too short",
         )
     if middle_end < requested_end:
@@ -1025,6 +1048,7 @@ def choose_smart_cut_plan(
             end_delta=end_delta,
             alignment_available=alignment_available,
             tools=tools,
+            video_encoder=video_encoder,
             reason="selection stays inside one GOP",
         )
     return CutPlan(
@@ -1039,7 +1063,7 @@ def choose_smart_cut_plan(
         start_delta=start_delta,
         end_delta=end_delta,
         alignment_available=True,
-        video_encoder=get_preferred_video_encoder(tools.ffmpeg),
+        video_encoder=video_encoder,
         segments=tuple(segments),
     )
 
@@ -1054,6 +1078,7 @@ def build_precise_fallback_plan(
     end_delta: float,
     alignment_available: bool,
     tools: ToolPaths,
+    video_encoder: str,
     reason: str,
 ) -> CutPlan:
     return CutPlan(
@@ -1068,7 +1093,7 @@ def build_precise_fallback_plan(
         start_delta=start_delta,
         end_delta=end_delta,
         alignment_available=alignment_available,
-        video_encoder=get_preferred_video_encoder(tools.ffmpeg),
+        video_encoder=video_encoder,
         segments=(RenderSegment("full", "precise", requested_start, requested_end),),
         fallback_reason=reason,
     )
@@ -1160,6 +1185,14 @@ def get_preferred_video_encoder(ffmpeg: str) -> str:
     encoder = pick_preferred_video_encoder(available)
     _VIDEO_ENCODER_CACHE[resolved_ffmpeg] = encoder
     return encoder
+
+
+def resolve_video_encoder(tools: ToolPaths, video_encoder: str) -> str:
+    if video_encoder == "auto":
+        return get_preferred_video_encoder(tools.ffmpeg)
+    if video_encoder in VIDEO_ENCODER_CHOICES:
+        return video_encoder
+    return get_preferred_video_encoder(tools.ffmpeg)
 
 
 def parse_ffmpeg_encoder_names(output: str) -> set[str]:
@@ -1415,6 +1448,7 @@ def execute_cut_plan(
                 end_delta=plan.end_delta,
                 alignment_available=plan.alignment_available,
                 tools=tools,
+                video_encoder=active_plan.video_encoder or get_preferred_video_encoder(tools.ffmpeg),
                 reason="output duration mismatch",
             )
             log_info("retry precise fallback source=%s reason=output duration mismatch plan=%s", source, format_cut_plan_summary(active_plan))
@@ -1472,7 +1506,10 @@ def _execute_cut_plan_once(
 
 
 def verify_output_duration(plan: CutPlan, tools: ToolPaths, output: Path) -> None:
-    expected_duration = max(0.0, plan.requested_end - plan.requested_start)
+    if plan.mode == "copy":
+        expected_duration = max(0.0, plan.actual_end - plan.actual_start)
+    else:
+        expected_duration = max(0.0, plan.requested_end - plan.requested_start)
     actual_duration = probe_duration(output, tools)
     drift = abs(actual_duration - expected_duration)
     log_info(
@@ -1646,7 +1683,8 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             self.max_segments_per_side = DEFAULT_MAX_SEGMENTS_PER_SIDE
             self.cut_output_dir: Path | None = None
             self.auto_reencode_threshold = DEFAULT_AUTO_REENCODE_THRESHOLD
-            self.cut_mode_var = tk.StringVar(value="smart")
+            self.cut_mode_var = tk.StringVar(value="copy")
+            self.video_encoder_var = tk.StringVar(value="auto")
             self._build()
             if self.dnd_enabled:
                 self._set_status("请选择视频/目录，或直接拖拽视频/目录到窗口。")
@@ -1759,7 +1797,7 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
             ).pack(side="left")
             ttk.Radiobutton(
                 bottom,
-                text="快速: 关键帧复制",
+                text="快速: 关键帧复制(最快)",
                 variable=self.cut_mode_var,
                 value="copy",
             ).pack(side="left", padx=(8, 0))
@@ -1769,9 +1807,17 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
                 variable=self.cut_mode_var,
                 value="precise",
             ).pack(side="left", padx=(8, 0))
+            ttk.Label(bottom, text="编码器").pack(side="left", padx=(12, 4))
+            ttk.Combobox(
+                bottom,
+                textvariable=self.video_encoder_var,
+                values=VIDEO_ENCODER_CHOICES,
+                width=12,
+                state="readonly",
+            ).pack(side="left")
             ttk.Label(
                 bottom,
-                text="推荐模式默认选中；快速模式可能多出几秒，检测到偏差会自动兜底",
+                text="默认快速；需要更准切点时再选推荐或始终精确，auto 会优先使用显卡编码",
             ).pack(side="left", padx=(12, 0))
 
         def _resize_canvas_window(self, event: Any) -> None:
@@ -2133,14 +2179,17 @@ def launch_gui(args: argparse.Namespace, tools: ToolPaths) -> None:
                     results.append(f"跳过 {source.name}: 无片头/片尾广告")
                     log_info("gui skip source=%s reason=no ads selected", source)
                     continue
+                cut_mode = self.cut_mode_var.get()
+                auto_reencode_threshold = float("inf") if cut_mode == "copy" else self.auto_reencode_threshold
                 plan = choose_cut_plan(
                     source=source,
                     requested_start=requested_start,
                     requested_end=requested_end,
                     tools=self.tools,
-                    force_precise=self.cut_mode_var.get() == "precise",
-                    prefer_smart_edges=self.cut_mode_var.get() == "smart",
-                    auto_reencode_threshold=self.auto_reencode_threshold,
+                    force_precise=cut_mode == "precise",
+                    prefer_smart_edges=cut_mode == "smart",
+                    auto_reencode_threshold=auto_reencode_threshold,
+                    video_encoder=self.video_encoder_var.get(),
                 )
                 if plan.actual_end <= plan.actual_start:
                     results.append(f"跳过 {source.name}: 裁剪范围无效")
